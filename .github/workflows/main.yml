@@ -1,0 +1,121 @@
+name: Rust Package
+
+# 触发条件：推送到main分支、创建PR到main分支、收到新的Star
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  watch:
+    types: [started]  # 当有人Star项目时触发
+
+jobs:
+  build:
+    name: Build and Package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: ${{ matrix.target }}
+        default: true
+        components: rustfmt, clippy
+
+    - name: Cache cargo dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - name: Check code format
+      uses: actions-rs/cargo@v1
+      with:
+        command: fmt
+        args: --all -- --check
+
+    - name: Run clippy (linting)
+      uses: actions-rs/cargo@v1
+      with:
+        command: clippy
+        args: -- -D warnings
+
+    - name: Run tests
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
+        args: --release
+
+    - name: Build release
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release --target ${{ matrix.target }}
+
+    - name: Prepare package
+      id: package
+      run: |
+        # 从Cargo.toml提取项目名称和版本号
+        PROJECT_NAME=$(cargo metadata --format-version=1 | jq -r '.packages[0].name')
+        VERSION=$(cargo metadata --format-version=1 | jq -r '.packages[0].version')
+        
+        # 处理不同平台的可执行文件扩展名
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          EXE_EXT=".exe"
+        else
+          EXE_EXT=""
+        fi
+        BINARY_NAME="${PROJECT_NAME}${EXE_EXT}"
+        ARCHIVE_NAME="${PROJECT_NAME}-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
+        
+        # 创建打包目录并复制文件
+        mkdir -p package
+        cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "package/"
+        [ -f "README.md" ] && cp README.md package/
+        [ -f "LICENSE" ] && cp LICENSE package/
+        
+        # 打包文件
+        if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+          tar -czf "${ARCHIVE_NAME}" -C package .
+        else
+          7z a "${ARCHIVE_NAME}" ./package/*
+        fi
+        
+        # 输出变量供后续步骤使用
+        echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+        echo "project_name=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ steps.package.outputs.project_name }}-${{ steps.package.outputs.version }}-${{ matrix.target }}
+        path: ${{ steps.package.outputs.archive_name }}
+
+    # 仅在推送到main分支时创建Release（避免Star事件重复创建）
+    - name: Create Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.package.outputs.version }}
+        name: Release v${{ steps.package.outputs.version }}
+        files: ${{ steps.package.outputs.archive_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
